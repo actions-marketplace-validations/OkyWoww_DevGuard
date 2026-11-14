@@ -20,6 +20,17 @@ jobs:
         with:
           fetch-depth: 2 # Memungkinkan git diff memeriksa file yang dimodifikasi
 
+      - name: Set up Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Run Integration Tests
+        run: npm test
+
       - name: Run DevGuard Adversarial Audit
         id: devguard
         uses: ./

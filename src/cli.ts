@@ -14,6 +14,13 @@ import { generateSarifReport } from './sarifGenerator.js';
 
 dotenv.config();
 
+function writeGitHubOutput(outputFile: string | undefined, key: string, value: string | number): void {
+  if (!outputFile || !fs.existsSync(outputFile)) return;
+  const safeKey = String(key).replace(/[\r\n=]/g, '');
+  const safeValue = String(value).replace(/[\r\n]+/g, ' ').trim();
+  fs.appendFileSync(outputFile, `${safeKey}=${safeValue}\n`);
+}
+
 export interface CliAuditResult {
   mode: 'zero-api' | 'hybrid';
   isLiveApi: boolean;
@@ -239,11 +246,9 @@ export async function runAction() {
     const sarifFile = process.env.DEVGUARD_SARIF_OUTPUT || 'devguard-results.sarif';
     generateSarifReport([], sarifFile);
     const outputFile = process.env.GITHUB_OUTPUT;
-    if (outputFile && fs.existsSync(outputFile)) {
-      fs.appendFileSync(outputFile, `overall_score=100\n`);
-      fs.appendFileSync(outputFile, `audit_status=PASS\n`);
-      fs.appendFileSync(outputFile, `sarif_file=${sarifFile}\n`);
-    }
+    writeGitHubOutput(outputFile, 'overall_score', 100);
+    writeGitHubOutput(outputFile, 'audit_status', 'PASS');
+    writeGitHubOutput(outputFile, 'sarif_file', sarifFile);
     process.exit(0);
   }
 
@@ -301,10 +306,8 @@ export async function runAction() {
 
   // GitHub Actions Workflow Output Parameters
   const outputFile = process.env.GITHUB_OUTPUT;
-  if (outputFile && fs.existsSync(outputFile)) {
-    fs.appendFileSync(outputFile, `overall_score=${avgScore}\n`);
-    fs.appendFileSync(outputFile, `audit_status=${hasFatalFailure ? 'FAIL' : 'PASS'}\n`);
-  }
+  writeGitHubOutput(outputFile, 'overall_score', avgScore);
+  writeGitHubOutput(outputFile, 'audit_status', hasFatalFailure ? 'FAIL' : 'PASS');
 
   // Comment before process.exit so the report is posted on both pass and failure.
   await postPullRequestComment(summaries, minScore, engineMode);
@@ -313,9 +316,7 @@ export async function runAction() {
   const sarifFile = process.env.DEVGUARD_SARIF_OUTPUT || 'devguard-results.sarif';
   generateSarifReport(summaries, sarifFile);
 
-  if (outputFile && fs.existsSync(outputFile)) {
-    fs.appendFileSync(outputFile, `sarif_file=${sarifFile}\n`);
-  }
+  writeGitHubOutput(outputFile, 'sarif_file', sarifFile);
 
   if (hasFatalFailure) {
     console.error('🚫 DevGuard Quality Gate Rejected: Ditemukan celah keamanan atau regresi logika.');

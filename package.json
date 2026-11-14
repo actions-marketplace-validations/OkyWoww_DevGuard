@@ -12,6 +12,8 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
+    "pretest": "node -e \"require('fs').rmSync('.test-dist', { recursive: true, force: true })\"",
+    "test": "tsc -p tsconfig.test.json && node --test .test-dist/tests/*.test.js",
     "demo": "python demo_gdg_jakarta.py",
     "demo:auto": "python demo_gdg_jakarta.py --auto",
     "video:preview": "remotion studio remotion/index.ts",

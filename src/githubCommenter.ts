@@ -11,11 +11,10 @@ export interface FileAuditSummary {
   defenseInDepth: string[];
 }
 
-const COMMENT_SIGNATURE = '<!-- devguard-adversarial-audit-sticky-comment -->';
-const API_BASE = 'https://api.github.com';
+export const COMMENT_SIGNATURE = '<!-- devguard-adversarial-audit-sticky-comment -->';
 
 function escapeTableCell(value: string): string {
-  return value.replace(/\|/g, '\\|').replace(/[\r\n]+/g, ' ');
+  return value.replace(/\|/g, '\\|').replace(/`/g, '\\`').replace(/[\r\n]+/g, ' ');
 }
 
 export async function postPullRequestComment(
@@ -60,7 +59,7 @@ export async function postPullRequestComment(
   let detailsSection = '';
   for (const summary of summaries) {
     if (summary.fatalFlaws.length > 0 || summary.defenseInDepth.length > 0) {
-      detailsSection += `\n#### 🔍 Detail Audit: \`${summary.filePath.replace(/`/g, '\\`')}\`\n`;
+      detailsSection += `\n#### 🔍 Detail Audit: \`${summary.filePath.replace(/`/g, '\\`').replace(/[\r\n]+/g, ' ')}\`\n`;
       if (summary.fatalFlaws.length > 0) {
         detailsSection += '**💣 Celah Keamanan / Logika Terdeteksi:**\n';
         summary.fatalFlaws.forEach((flaw) => {
@@ -92,7 +91,8 @@ ${detailsSection}
 ---
 *Diinspeksi secara otomatis oleh [DevGuard Zero-Leniency Auditor](https://github.com/marketplace/actions/devguard-adversarial-code-auditor).*`;
 
-  const commentsUrl = `${API_BASE}/repos/${repo}/issues/${prNumber}/comments`;
+  const apiBase = (process.env.GITHUB_API_URL || 'https://api.github.com').replace(/\/+$/, '');
+  const commentsUrl = `${apiBase}/repos/${repo}/issues/${prNumber}/comments`;
   const headers = {
     Authorization: `Bearer ${token}`,
     Accept: 'application/vnd.github+json',
@@ -117,7 +117,7 @@ ${detailsSection}
     }
 
     if (botComment) {
-      const updateUrl = `${API_BASE}/repos/${repo}/issues/comments/${botComment.id}`;
+      const updateUrl = `${apiBase}/repos/${repo}/issues/comments/${botComment.id}`;
       const updateResp = await fetch(updateUrl, {
         method: 'PATCH',
         headers,

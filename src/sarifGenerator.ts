@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { FileAuditSummary } from './githubCommenter';
+import type { FileAuditSummary } from './githubCommenter.js';
 
 export interface SarifFindingLocation {
   filePath: string;
