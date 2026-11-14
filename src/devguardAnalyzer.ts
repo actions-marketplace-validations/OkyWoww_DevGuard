@@ -1,3 +1,39 @@
+import {
+  analyzeLexicalStructure,
+  calculateShannonEntropy,
+  damerauLevenshtein,
+  isCommentOrEmptyLine,
+  type AuditAnalyzeOptions,
+  type DevGuardRuleId,
+  type InlineFinding,
+  type LineFinding,
+} from './rules/lexicalMasker.js';
+import {
+  POPULAR_NPM_PACKAGES,
+  detectHallucinatedPackages,
+  detectNonAtomicBalanceMutations,
+  detectSwallowedExceptions,
+} from './rules/packageAndExceptionRules.js';
+import {
+  DG007_PROVIDER_PATTERNS,
+  detectHardcodedSecrets,
+  detectMissingTimeoutsAndLoops,
+} from './rules/secretAndResilienceRules.js';
+
+export type { AuditAnalyzeOptions, DevGuardRuleId, InlineFinding };
+export {
+  DG007_PROVIDER_PATTERNS,
+  POPULAR_NPM_PACKAGES,
+  analyzeLexicalStructure,
+  calculateShannonEntropy,
+  damerauLevenshtein,
+  detectHallucinatedPackages,
+  detectHardcodedSecrets,
+  detectMissingTimeoutsAndLoops,
+  detectNonAtomicBalanceMutations,
+  detectSwallowedExceptions,
+};
+
 export interface ParsedScores {
   security: number;
   securityDeductions: string[];
@@ -35,7 +71,10 @@ export interface ParsedDevGuardReport {
   verifiedMitigations?: string[];
   residualNotes?: string[];
   isHardened?: boolean;
+  inlineFindings?: InlineFinding[];
 }
+
+export type AuditReport = ParsedDevGuardReport;
 
 // =============================================================================
 // UPGRADED PRODUCTION-GRADE REMEDIATION SNIPPETS (SECTION 3)
@@ -250,22 +289,13 @@ function calculateTotal(items, discountCode) {
 // Evaluates the exact live code string line-by-line on every single audit run.
 // =============================================================================
 
-interface LineFinding {
-  line: number;
-  extraLines?: number[];
-  category: 'security' | 'correctness' | 'maintainability';
-  penalty: number;
-  shortReason: string;
-  detailedReason: string;
-  isCritical?: boolean;
-}
-
-function isCommentOrEmptyLine(line: string): boolean {
-  const t = line.trim();
-  return !t || t.startsWith('//') || t.startsWith('#') || t.startsWith('/*') || t.startsWith('*') || t.startsWith('"""') || t.startsWith("'''");
-}
-
-export function analyzeCodeDeterministically(code: string): ParsedDevGuardReport {
+export function analyzeCodeDeterministically(
+  code: string,
+  options?: AuditAnalyzeOptions
+): ParsedDevGuardReport {
+  if (typeof code !== 'string') {
+    throw new TypeError('code input must be a string');
+  }
   const rawLines = code.split('\n');
   const execLines: Array<{ num: number; text: string }> = [];
 
@@ -276,21 +306,39 @@ export function analyzeCodeDeterministically(code: string): ParsedDevGuardReport
   }
 
   const codeWithoutComments = execLines.map((l) => l.text).join('\n');
+  const normalizedFilePath = (options?.filePath || '').replace(/\\/g, '/');
+
+  // Exclude DevGuard's own analyzer & rule modules from demo preset domain matching
+  const isSelfAnalyzerModule =
+    /(?:^|\/)src\/(?:devguardAnalyzer\.ts|rules\/[^/]+\.ts)$/.test(normalizedFilePath) ||
+    (/\bexport\s+function\s+analyzeCodeDeterministically\b/.test(codeWithoutComments) &&
+      /\bUPGRADED_REMEDIATION_SNIPPETS\b/.test(codeWithoutComments)) ||
+    /\bexport\s+(?:const\s+(?:POPULAR_NPM_PACKAGES|DG007_PROVIDER_PATTERNS)|function\s+(?:analyzeLexicalStructure|detectHallucinatedPackages|detectHardcodedSecrets))\b/.test(
+      codeWithoutComments
+    );
 
   // Detect domain & language from executable code
-  const isSqlDomain = /(?:SELECT\s+|UPDATE\s+members|INSERT\s+INTO|DELETE\s+FROM|sqlite3|db\.execute|kirim_poin)/i.test(codeWithoutComments);
-  const isPingDomain = /(?:ping_host|ping\s+-c|subprocess\.run|os\.system|ipaddress\.ip_address)/i.test(codeWithoutComments) && !isSqlDomain;
-  const isAuthDomain = /(?:JWT_SECRET|jsonwebtoken|jwt\.verify|billingService|\/api\/users\/:id\/billing)/i.test(codeWithoutComments) && !isSqlDomain;
-  const isFileDomain = /(?:downloadReport|public\/reports|req\.query\.file|res\.download|res\.sendFile)/i.test(codeWithoutComments) && !isSqlDomain;
-  const isCartDomain = /(?:calculateTotal|discountCode|VIP100|SERVER_PRICE_CATALOG|items\[i\]\.price|item\.quantity)/i.test(codeWithoutComments) && !isSqlDomain;
+  const isSqlDomain = !isSelfAnalyzerModule && /(?:SELECT\s+|UPDATE\s+members|INSERT\s+INTO|DELETE\s+FROM|sqlite3|db\.execute|kirim_poin)/i.test(codeWithoutComments);
+  const isPingDomain = !isSelfAnalyzerModule && /(?:ping_host|ping\s+-c|subprocess\.run|os\.system|ipaddress\.ip_address)/i.test(codeWithoutComments) && !isSqlDomain;
+  const isAuthDomain = !isSelfAnalyzerModule && /(?:JWT_SECRET|jsonwebtoken|jwt\.verify|billingService|\/api\/users\/:id\/billing)/i.test(codeWithoutComments) && !isSqlDomain;
+  const isFileDomain = !isSelfAnalyzerModule && /(?:downloadReport|public\/reports|req\.query\.file|res\.download|res\.sendFile)/i.test(codeWithoutComments) && !isSqlDomain;
+  const isCartDomain = !isSelfAnalyzerModule && /(?:calculateTotal|discountCode|VIP100|SERVER_PRICE_CATALOG|items\[i\]\.price|item\.quantity)/i.test(codeWithoutComments) && !isSqlDomain;
 
-  const isPython = isSqlDomain || isPingDomain || /\bdef\s+\w+\s*\(|\bimport\s+\w+|\braise\s+ValueError/i.test(codeWithoutComments);
-  const isTypeScript = isAuthDomain || /:\s*(?:string|number|boolean|any|Request|Response|JwtPayload)\b|\binterface\s+\w+/i.test(codeWithoutComments);
+  const hasJsSyntax = isSelfAnalyzerModule || /\bfrom\s+['"]|\brequire\s*\(|\b(?:const|let|var|function|async|export|interface)\b/.test(codeWithoutComments);
+  const isPython = !isSelfAnalyzerModule && (isSqlDomain || isPingDomain || (!hasJsSyntax && /\bdef\s+\w+\s*\(|\bimport\s+\w+|\braise\s+ValueError/i.test(codeWithoutComments)));
+  const isTypeScript = isSelfAnalyzerModule || isAuthDomain || /:\s*(?:string|number|boolean|any|Request|Response|JwtPayload)\b|\binterface\s+\w+/i.test(codeWithoutComments);
   const language = isPython ? 'python' : isTypeScript ? 'typescript' : 'javascript';
 
+  const lexical = analyzeLexicalStructure(code, isPython);
+  const maskedLines = lexical.maskedCode.split('\n');
+
   const findings: LineFinding[] = [];
+  const inlineFindings: InlineFinding[] = [];
   const verifiedMitigations: string[] = [];
   const residualNotes: string[] = [];
+
+  // DG007 runs early across both Python & JS/TS so fallback rules avoid double-penalizing the same line
+  const dg007FlaggedLines = detectHardcodedSecrets(code, rawLines, lexical.stringLiterals, findings, inlineFindings);
 
   const findLine = (regex: RegExp, fallback = 1): number => {
     for (const l of execLines) {
@@ -961,7 +1009,7 @@ export function analyzeCodeDeterministically(code: string): ParsedDevGuardReport
   // 6. CUSTOM SCRATCHPAD / GENERAL CODE RULES
   // ---------------------------------------------------------------------------
   else {
-    const evalLines = findAllLines(/\beval\s*\(|\bexec\s*\(|os\.system\s*\(|child_process\.exec/i);
+    const evalLines = findAllLines(/(?:^|[^.\w])(?:eval|exec)\s*\(|os\.system\s*\(|child_process\.exec/i);
     if (evalLines.length > 0) {
       findings.push({
         line: evalLines[0],
@@ -973,7 +1021,8 @@ export function analyzeCodeDeterministically(code: string): ParsedDevGuardReport
       });
     }
 
-    const secretLines = findAllLines(/(?:secret|password|api_key|apikey|token)\s*=\s*["'][^"']{4,}["']/i);
+    const secretLines = findAllLines(/(?:secret|password|api_key|apikey|token)\s*=\s*["'][^"']{4,}["']/i)
+      .filter((ln) => !dg007FlaggedLines.has(ln));
     if (secretLines.length > 0) {
       findings.push({
         line: secretLines[0],
@@ -1051,16 +1100,20 @@ export function analyzeCodeDeterministically(code: string): ParsedDevGuardReport
   // ---------------------------------------------------------------------------
   // UNIVERSAL CROSS-CUTTING CHECKS (Apply to any edited code if not already flagged)
   // ---------------------------------------------------------------------------
-  // 1. Check for TypeScript `any` in non-auth snippets too
-  if (!isAuthDomain && /:\s*any\b/.test(codeWithoutComments)) {
-    const anyL = findAllLines(/:\s*any\b/);
-    findings.push({
-      line: anyL[0],
-      category: 'maintainability',
-      penalty: 15,
-      shortReason: `-15 Penggunaan tipe ': any' melemahkan pemeriksaan tipe statis (baris ${anyL.join(', ')})`,
-      detailedReason: `Hindari penggunaan ': any' pada baris ${anyL.join(', ')}; gunakan tipe eksplisit atau generic.`,
-    });
+  // 1. Check for TypeScript `any` in non-auth snippets (scan maskedCode so regex/string literals aren't flagged)
+  if (!isAuthDomain && /:\s*any\b/.test(lexical.maskedCode)) {
+    const anyL = maskedLines
+      .map((lineText, idx) => (/:\s*any\b/.test(lineText) ? idx + 1 : 0))
+      .filter((num) => num > 0);
+    if (anyL.length > 0) {
+      findings.push({
+        line: anyL[0],
+        category: 'maintainability',
+        penalty: 15,
+        shortReason: `-15 Penggunaan tipe ': any' melemahkan pemeriksaan tipe statis (baris ${anyL.join(', ')})`,
+        detailedReason: `Hindari penggunaan ': any' pada baris ${anyL.join(', ')}; gunakan tipe eksplisit atau generic.`,
+      });
+    }
   }
 
   // 2. Check for raw error message leakage to HTTP response
@@ -1074,6 +1127,14 @@ export function analyzeCodeDeterministically(code: string): ParsedDevGuardReport
       detailedReason: `Mengirimkan err.message mentah ke respons klien pada baris ${leakLine} dapat membocorkan struktur path atau skema database internal.`,
       isCritical: true,
     });
+  }
+
+  // 3. v1.2.0 Deterministic AI-Slop & Vibe-Coding Detectors (DG004, DG005, DG006, DG008)
+  if (!isPython) {
+    detectHallucinatedPackages(execLines, maskedLines, options, findings, inlineFindings);
+    detectSwallowedExceptions(code, findings, inlineFindings);
+    detectNonAtomicBalanceMutations(rawLines, findings, inlineFindings);
+    detectMissingTimeoutsAndLoops(code, lexical.maskedCode, rawLines, findings, inlineFindings);
   }
 
   // ---------------------------------------------------------------------------
@@ -1367,5 +1428,6 @@ ${tesMarkdown}`;
     verifiedMitigations,
     residualNotes,
     isHardened,
+    inlineFindings: inlineFindings.length > 0 ? inlineFindings : undefined,
   };
 }

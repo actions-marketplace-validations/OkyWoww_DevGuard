@@ -2,17 +2,28 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execSync } from 'node:child_process';
+import { builtinModules } from 'node:module';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   analyzeCodeDeterministically,
   ParsedDevGuardReport,
 } from './devguardAnalyzer.js';
-import { postPullRequestComment } from './githubCommenter.js';
+import {
+  postInlineReviewComments,
+  postPullRequestComment,
+} from './githubCommenter.js';
 import type { FileAuditSummary } from './githubCommenter.js';
 import { generateSarifReport } from './sarifGenerator.js';
 
 dotenv.config();
+
+function writeGitHubOutput(outputFile: string | undefined, key: string, value: string | number): void {
+  if (!outputFile || !fs.existsSync(outputFile)) return;
+  const safeKey = String(key).replace(/[\r\n=]/g, '');
+  const safeValue = String(value).replace(/[\r\n]+/g, ' ').trim();
+  fs.appendFileSync(outputFile, `${safeKey}=${safeValue}\n`);
+}
 
 export interface CliAuditResult {
   mode: 'zero-api' | 'hybrid';
@@ -20,12 +31,44 @@ export interface CliAuditResult {
   parsedReport: ParsedDevGuardReport;
 }
 
+function resolveNearestPackageDependencies(filePath: string): Set<string> | undefined {
+  try {
+    let currentDir = path.dirname(path.resolve(filePath));
+    while (true) {
+      const pkgPath = path.join(currentDir, 'package.json');
+      if (fs.existsSync(pkgPath)) {
+        const parsed = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as {
+          dependencies?: Record<string, unknown>;
+          devDependencies?: Record<string, unknown>;
+          peerDependencies?: Record<string, unknown>;
+        };
+        return new Set([
+          ...Object.keys(parsed.dependencies || {}),
+          ...Object.keys(parsed.devDependencies || {}),
+          ...Object.keys(parsed.peerDependencies || {}),
+        ]);
+      }
+      const parentDir = path.dirname(currentDir);
+      if (parentDir === currentDir) break;
+      currentDir = parentDir;
+    }
+  } catch {
+    // SPOF mitigation: ignore unreadable or malformed package.json
+  }
+  return undefined;
+}
+
 export async function evaluateCodeHybrid(
   code: string,
   apiKey?: string,
-  precomputedL1?: ParsedDevGuardReport
+  precomputedL1?: ParsedDevGuardReport,
+  filePath?: string
 ): Promise<CliAuditResult> {
-  const l1Result = precomputedL1 || analyzeCodeDeterministically(code);
+  const l1Result = precomputedL1 || analyzeCodeDeterministically(code, {
+    filePath,
+    declaredDependencies: filePath ? resolveNearestPackageDependencies(filePath) : undefined,
+    builtinModules,
+  });
   const activeKey = apiKey || process.env.GEMINI_API_KEY;
 
   if (!activeKey || activeKey === 'MY_GEMINI_API_KEY' || !activeKey.startsWith('AIzaSy')) {
@@ -57,7 +100,7 @@ export async function evaluateCodeHybrid(
       setTimeout(() => reject(new Error('Gemini API timeout')), 6500)
     );
 
-    const response: any = await Promise.race([
+    const response = (await Promise.race([
       ai.models.generateContent({
         model: 'gemini-3.8-flash',
         contents: prompt,
@@ -104,9 +147,9 @@ export async function evaluateCodeHybrid(
         },
       }),
       timeoutPromise,
-    ]);
+    ])) as { text?: string };
 
-    const geminiData = JSON.parse(response.text.trim());
+    const geminiData = JSON.parse((response.text || '').trim());
 
     // Ceilings enforced by Layer 1 zero-leniency rubric
     const reconciledSecurity = Math.min(l1Result.skor.security, geminiData.skor?.security ?? 100);
@@ -146,8 +189,9 @@ export async function evaluateCodeHybrid(
         },
       },
     };
-  } catch (err: any) {
-    console.warn(`⚠️  Gemini API error (${err.message}). Otomatis dialihkan ke Layer 1 AST Engine.`);
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.warn(`⚠️  Gemini API error (${errMsg}). Otomatis dialihkan ke Layer 1 AST Engine.`);
     return {
       mode: 'zero-api',
       isLiveApi: false,
@@ -156,12 +200,35 @@ export async function evaluateCodeHybrid(
   }
 }
 
+function resolveCliFileArgs(args: string[]): string[] {
+  const resolved: string[] = [];
+  for (const rawArg of args) {
+    if (rawArg.startsWith('--')) continue;
+    if (fs.existsSync(rawArg)) {
+      resolved.push(rawArg);
+      continue;
+    }
+    if (rawArg.includes('*')) {
+      const dir = path.dirname(rawArg);
+      const pattern = path.basename(rawArg).replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+      const matcher = new RegExp(`^${pattern}$`);
+      if (fs.existsSync(dir)) {
+        for (const entry of fs.readdirSync(dir)) {
+          if (matcher.test(entry)) {
+            resolved.push(path.join(dir, entry));
+          }
+        }
+      }
+    }
+  }
+  return Array.from(new Set(resolved));
+}
+
 export async function runAction() {
   const apiKey = process.env.GEMINI_API_KEY;
   const minScore = parseInt(process.env.DEVGUARD_MIN_SCORE || '85', 10);
   const targetPattern = process.env.DEVGUARD_TARGET || 'modified';
-  const args = process.argv.slice(2);
-  const explicitFileArg = args.find((a) => !a.startsWith('--'));
+  const explicitFileArgs = resolveCliFileArgs(process.argv.slice(2));
   const engineMode: 'HYBRID' | 'OFFLINE_AST' =
     apiKey && apiKey !== 'MY_GEMINI_API_KEY' && apiKey.startsWith('AIzaSy') ? 'HYBRID' : 'OFFLINE_AST';
 
@@ -179,8 +246,8 @@ export async function runAction() {
   // 1. Dapatkan daftar berkas target
   let filesToAudit: string[] = [];
 
-  if (explicitFileArg && fs.existsSync(explicitFileArg)) {
-    filesToAudit = [explicitFileArg];
+  if (explicitFileArgs.length > 0) {
+    filesToAudit = explicitFileArgs;
   } else if (targetPattern === 'all') {
     // Scan recursively for py, ts, js excluding node_modules, dist, etc.
     const scanDir = (dir: string): string[] => {
@@ -239,11 +306,9 @@ export async function runAction() {
     const sarifFile = process.env.DEVGUARD_SARIF_OUTPUT || 'devguard-results.sarif';
     generateSarifReport([], sarifFile);
     const outputFile = process.env.GITHUB_OUTPUT;
-    if (outputFile && fs.existsSync(outputFile)) {
-      fs.appendFileSync(outputFile, `overall_score=100\n`);
-      fs.appendFileSync(outputFile, `audit_status=PASS\n`);
-      fs.appendFileSync(outputFile, `sarif_file=${sarifFile}\n`);
-    }
+    writeGitHubOutput(outputFile, 'overall_score', 100);
+    writeGitHubOutput(outputFile, 'audit_status', 'PASS');
+    writeGitHubOutput(outputFile, 'sarif_file', sarifFile);
     process.exit(0);
   }
 
@@ -262,10 +327,11 @@ export async function runAction() {
     auditedCount++;
 
     console.log(`\n🔍 Menganalisis: ${filePath}`);
-    const result = await evaluateCodeHybrid(codeContent, apiKey);
+    const result = await evaluateCodeHybrid(codeContent, apiKey, undefined, filePath);
     const report = result.parsedReport;
     const score = report.skor;
-    const passed = !(score.totalScore < minScore || (!report.isHardened && score.security < 70));
+    const hasInlineErrors = report.inlineFindings?.some((f) => f.severity === 'error') ?? false;
+    const passed = !(score.totalScore < minScore || (!report.isHardened && score.security < 70) || hasInlineErrors);
 
     totalScoreSum += score.totalScore;
     summaries.push({
@@ -277,6 +343,7 @@ export async function runAction() {
       passed,
       fatalFlaws: !passed && report.temuanUtama.description ? [report.temuanUtama.description] : [],
       defenseInDepth: report.residualNotes || [],
+      inlineFindings: report.inlineFindings,
     });
 
     console.log(`   - Security        : ${score.security}/100`);
@@ -301,21 +368,18 @@ export async function runAction() {
 
   // GitHub Actions Workflow Output Parameters
   const outputFile = process.env.GITHUB_OUTPUT;
-  if (outputFile && fs.existsSync(outputFile)) {
-    fs.appendFileSync(outputFile, `overall_score=${avgScore}\n`);
-    fs.appendFileSync(outputFile, `audit_status=${hasFatalFailure ? 'FAIL' : 'PASS'}\n`);
-  }
+  writeGitHubOutput(outputFile, 'overall_score', avgScore);
+  writeGitHubOutput(outputFile, 'audit_status', hasFatalFailure ? 'FAIL' : 'PASS');
 
-  // Comment before process.exit so the report is posted on both pass and failure.
+  // Comment & post inline review suggestions before process.exit so reports are posted on both pass and failure.
   await postPullRequestComment(summaries, minScore, engineMode);
+  await postInlineReviewComments(summaries);
 
   // Generate SARIF v2.1.0 report before process.exit so findings are always exported
   const sarifFile = process.env.DEVGUARD_SARIF_OUTPUT || 'devguard-results.sarif';
   generateSarifReport(summaries, sarifFile);
 
-  if (outputFile && fs.existsSync(outputFile)) {
-    fs.appendFileSync(outputFile, `sarif_file=${sarifFile}\n`);
-  }
+  writeGitHubOutput(outputFile, 'sarif_file', sarifFile);
 
   if (hasFatalFailure) {
     console.error('🚫 DevGuard Quality Gate Rejected: Ditemukan celah keamanan atau regresi logika.');

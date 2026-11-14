@@ -26,5 +26,6 @@ devguard.zip
 full_request10.txt
 user_spec_request10.txt
 *.sarif
+.test-dist/
 
 
