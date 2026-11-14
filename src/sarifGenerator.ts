@@ -23,6 +23,41 @@ function extractLineNumber(text: string): number {
   return 1;
 }
 
+function createSarifResult(
+  ruleId: string,
+  level: 'error' | 'warning' | 'note',
+  text: string,
+  uri: string,
+  startLine: number,
+  endLine?: number
+): Record<string, unknown> {
+  const safeStartLine = Math.max(1, startLine);
+  const region: Record<string, number> = {
+    startLine: safeStartLine,
+    startColumn: 1,
+  };
+  if (endLine && endLine >= safeStartLine) {
+    region.endLine = endLine;
+  }
+
+  return {
+    ruleId,
+    level,
+    message: { text },
+    locations: [
+      {
+        physicalLocation: {
+          artifactLocation: {
+            uri,
+            uriBaseId: '%SRCROOT%',
+          },
+          region,
+        },
+      },
+    ],
+  };
+}
+
 export function generateSarifReport(
   summaries: FileAuditSummary[],
   outputPath: string = 'devguard-results.sarif'
@@ -87,6 +122,91 @@ export function generateSarifReport(
     }
   });
 
+  // Rule 4: Hallucinated & Typosquatted Packages (Slopsquatting)
+  rulesMap.set('DG004', {
+    id: 'DG004',
+    name: 'HallucinatedOrTyposquattedPackage',
+    shortDescription: {
+      text: 'Hallucinated, undeclared, or typosquatted package dependency detected.'
+    },
+    fullDescription: {
+      text: 'Detected a package import with a suspicious edit distance to a popular NPM package or absent from package.json.'
+    },
+    defaultConfiguration: { level: 'error' },
+    properties: {
+      tags: ['security', 'supply-chain', 'slopsquatting', 'external/cwe/cwe-829'],
+      'security-severity': '9.0'
+    }
+  });
+
+  // Rule 5: Swallowed Exceptions
+  rulesMap.set('DG005', {
+    id: 'DG005',
+    name: 'SwallowedExceptionInFlow',
+    shortDescription: {
+      text: 'Empty or console-only catch block swallows runtime failures.'
+    },
+    fullDescription: {
+      text: 'A catch block ignores exceptions or logs only without rethrowing, returning a failure state, or rolling back critical state.'
+    },
+    defaultConfiguration: { level: 'warning' },
+    properties: {
+      tags: ['security', 'reliability', 'error-handling', 'external/cwe/cwe-390'],
+      'security-severity': '6.5'
+    }
+  });
+
+  // Rule 6: Non-Atomic Balance / Stock Mutations (TOCTOU)
+  rulesMap.set('DG006', {
+    id: 'DG006',
+    name: 'NonAtomicBalanceOrStockMutation',
+    shortDescription: {
+      text: 'Non-atomic check-then-act mutation across await boundary (TOCTOU race condition).'
+    },
+    fullDescription: {
+      text: 'Reads and validates balance, stock, or quota state before mutating it across an asynchronous boundary without an atomic transaction or lock.'
+    },
+    defaultConfiguration: { level: 'error' },
+    properties: {
+      tags: ['security', 'concurrency', 'toctou', 'external/cwe/cwe-362'],
+      'security-severity': '8.8'
+    }
+  });
+
+  // Rule 7: Hardcoded AI, Payment & Cloud API Secrets
+  rulesMap.set('DG007', {
+    id: 'DG007',
+    name: 'HardcodedSecretOrApiKey',
+    shortDescription: {
+      text: 'Hardcoded AI, payment, or cloud API secret detected in source code.'
+    },
+    fullDescription: {
+      text: 'Detected a provider-prefixed API key or high-entropy credential literal assigned directly in source instead of loaded from environment variables.'
+    },
+    defaultConfiguration: { level: 'error' },
+    properties: {
+      tags: ['security', 'secrets', 'credentials', 'external/cwe/cwe-798'],
+      'security-severity': '9.5'
+    }
+  });
+
+  // Rule 8: Missing Fetch Timeout & Unbounded Async Loops
+  rulesMap.set('DG008', {
+    id: 'DG008',
+    name: 'MissingTimeoutOrUnboundedAsyncLoop',
+    shortDescription: {
+      text: 'Missing network AbortSignal timeout or unbounded async polling loop.'
+    },
+    fullDescription: {
+      text: 'Detected an external fetch() call lacking AbortSignal.timeout() or an unbounded loop containing await without break, return, throw, or bounded retry limits.'
+    },
+    defaultConfiguration: { level: 'error' },
+    properties: {
+      tags: ['security', 'reliability', 'resilience', 'external/cwe/cwe-400'],
+      'security-severity': '8.0'
+    }
+  });
+
   const results: Array<Record<string, unknown>> = [];
 
   for (const summary of summaries) {
@@ -95,77 +215,55 @@ export function generateSarifReport(
       : summary.filePath;
     const normalizedUri = relPath.replace(/\\/g, '/').replace(/^\.\//, '');
 
-    // 1. Masukkan semua Fatal Flaws sebagai SARIF 'error' (DG001)
+    // 1. Emit inlineFindings directly when present (DG001-DG008)
+    const inlineFindings = summary.inlineFindings || [];
+    for (const finding of inlineFindings) {
+      results.push(
+        createSarifResult(
+          finding.ruleId,
+          finding.severity,
+          finding.message,
+          normalizedUri,
+          finding.line,
+          finding.endLine
+        )
+      );
+    }
+
+    // 2. Masukkan Fatal Flaws sebagai SARIF 'error' (DG001) jika belum tercakup penuh oleh inlineFindings
+    const inlineErrorMessages = inlineFindings
+      .filter((f) => f.severity === 'error')
+      .map((f) => f.message);
+
     for (const flaw of summary.fatalFlaws) {
-      const line = extractLineNumber(flaw);
-      results.push({
-        ruleId: 'DG001',
-        level: 'error',
-        message: { text: flaw },
-        locations: [
-          {
-            physicalLocation: {
-              artifactLocation: {
-                uri: normalizedUri,
-                uriBaseId: '%SRCROOT%'
-              },
-              region: {
-                startLine: line,
-                startColumn: 1
-              }
-            }
-          }
-        ]
-      });
+      const coveredCompletelyByInline =
+        inlineErrorMessages.length > 0 &&
+        inlineErrorMessages.every((msg) => flaw.includes(msg)) &&
+        flaw.trim() === inlineErrorMessages.join(' ').trim();
+
+      if (!coveredCompletelyByInline) {
+        const line = extractLineNumber(flaw);
+        results.push(createSarifResult('DG001', 'error', flaw, normalizedUri, line));
+      }
     }
 
-    // 2. Jika skor gagal tapi fatalFlaws kosong, catat pelanggaran threshold (DG003)
-    if (!summary.passed && summary.fatalFlaws.length === 0) {
-      results.push({
-        ruleId: 'DG003',
-        level: 'error',
-        message: {
-          text: `DevGuard overall score (${summary.overall}/100) is below the required threshold. (Security: ${summary.security}, Correctness: ${summary.correctness}, Maintainability: ${summary.maintainability})`
-        },
-        locations: [
-          {
-            physicalLocation: {
-              artifactLocation: {
-                uri: normalizedUri,
-                uriBaseId: '%SRCROOT%'
-              },
-              region: {
-                startLine: 1,
-                startColumn: 1
-              }
-            }
-          }
-        ]
-      });
+    // 3. Jika skor gagal tapi fatalFlaws & inlineFindings error kosong, catat pelanggaran threshold (DG003)
+    if (!summary.passed && summary.fatalFlaws.length === 0 && inlineErrorMessages.length === 0) {
+      results.push(
+        createSarifResult(
+          'DG003',
+          'error',
+          `DevGuard overall score (${summary.overall}/100) is below the required threshold. (Security: ${summary.security}, Correctness: ${summary.correctness}, Maintainability: ${summary.maintainability})`,
+          normalizedUri,
+          1
+        )
+      );
     }
 
-    // 3. Masukkan catatan Defense-in-Depth sebagai SARIF 'warning' (DG002)
+    // 4. Masukkan catatan Defense-in-Depth sebagai SARIF 'warning' (DG002)
     for (const note of summary.defenseInDepth) {
       const line = extractLineNumber(note);
-      results.push({
-        ruleId: 'DG002',
-        level: 'warning',
-        message: { text: note },
-        locations: [
-          {
-            physicalLocation: {
-              artifactLocation: {
-                uri: normalizedUri,
-                uriBaseId: '%SRCROOT%'
-              },
-              region: {
-                startLine: line,
-                startColumn: 1
-              }
-            }
-          }
-        ]
-      });
+      results.push(createSarifResult('DG002', 'warning', note, normalizedUri, line));
     }
   }
 
@@ -178,7 +276,7 @@ export function generateSarifReport(
           driver: {
             name: 'DevGuard Adversarial Code Auditor',
             informationUri: 'https://github.com/OkyWoww/DevGuard',
-            version: '1.1.0',
+            version: '1.2.0',
             rules: Array.from(rulesMap.values())
           }
         },

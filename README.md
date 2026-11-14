@@ -1,160 +1,147 @@
-# DevGuard 🛡️
-> Zero-Leniency Hybrid Adversarial Code Reviewer & Security Gatekeeper powered by Google Gemini 3.8 Flash & Deterministic AST Heuristics.
+# 🛡️ DevGuard v1.2.0 — The AI-Slop & Vibe-Coding Security Gatekeeper
 
-[![GitHub Release](https://img.shields.io/github/v/release/OkyWoww/DevGuard?color=10B981&label=Release)](https://github.com/OkyWoww/DevGuard/releases)
-[![GitHub Action](https://img.shields.io/badge/GitHub_Action-DevGuard@v1.1.0-4285F4?logo=githubactions&logoColor=white)](https://github.com/OkyWoww/DevGuard)
-[![SARIF v2.1.0](https://img.shields.io/badge/SARIF-v2.1.0_Code_Scanning-FF69B4.svg)](https://docs.github.com/en/code-security/code-scanning)
-[![Model](https://img.shields.io/badge/Model-gemini--3.8--flash-34A853.svg)](https://ai.google.dev)
-[![Verification](https://img.shields.io/badge/SQLite_Harness-6%2F6_PASS-10B981.svg)](#-verifikasi-empiris-ab-test)
-[![Zero API Mode](https://img.shields.io/badge/Mode-Zero--API_Offline_Supported-blueviolet.svg)](#-mode-zero-api-100-offline--gratis)
+[![Zero-Dependency Runtime](https://img.shields.io/badge/Runtime-100%25%20Zero--Dependency-emerald.svg)](#architecture)
+[![OASIS SARIF v2.1.0](https://img.shields.io/badge/SARIF-v2.1.0%20Compliant-blue.svg)](#github-code-scanning-sarif)
+[![GitHub Action](https://img.shields.io/badge/GitHub%20Action-v1.2.0-black.svg)](#quick-start-60-second-setup)
+
+**DevGuard** is a deterministic CI/CD security gatekeeper engineered to catch silent failures, slopsquatting, leaked API keys, and financial race conditions hidden inside AI-generated (*Cursor, Windsurf, Copilot, Antigravity*) Pull Requests before they reach production.
+
+Unlike generic LLM code reviewers that only leave probabilistic chat comments, DevGuard combines a **0-latency Deterministic AST/Heuristic Engine** with **Gemini Adversarial Reasoning**, posts **One-Click GitHub Suggested Changes** directly on offending diff lines, and uploads **OASIS SARIF v2.1.0** reports to GitHub Code Scanning.
 
 ---
 
-## ⚡ Quickstart (GitHub Actions CI/CD)
+## 🎯 Why DevGuard?
 
-Amankan repositori Anda secara otomatis pada setiap Pull Request dan Push. Tambahkan berkas `.github/workflows/devguard.yml` ke repositori Anda:
+Modern AI coding assistants accelerate delivery, but frequently introduce subtle, high-impact defects ("AI-Slop") that pass traditional linters and unit tests:
+
+* **Slopsquatting & Phantom Imports:** Hallucinated or typosquatted NPM packages (`lodahs`, `express-jwt-verify`) that expose your build to supply-chain attacks.
+* **Silent Failure Slop:** Empty `catch (e) {}` or `console.log`-only error handlers swallowing critical payment, database, or authentication failures.
+* **Check-Then-Act Financial Race Conditions (TOCTOU):** Non-atomic balance or inventory checks separated by `await` calls, enabling double-spending under concurrent load.
+* **Hardcoded AI & Payment Keys:** Prototype API keys (`AIzaSy...`, `sk_live_...`, `ghp_...`) accidentally committed into Pull Requests.
+* **Unbounded Async Loops & Hanging Fetches:** `while (true)` polling or `fetch()` calls missing `AbortSignal.timeout()`, leading to worker exhaustion and runaway API bills.
+
+---
+
+## 📋 Deterministic Gatekeeper Rules (`DG001`–`DG008`)
+
+Layer 1 runs **100% offline with zero external runtime dependencies** and cannot be bypassed by prompt injection comments inside source files.
+
+| Rule ID | Category | Detection Target | Default Severity | Auto-Fix Suggestion |
+| :--- | :--- | :--- | :---: | :---: |
+| **`DG001`** | Code Execution & Traversal | Arbitrary `eval()`, unsanitized shell execution, and uncontained path traversal sinks | `error` | Yes |
+| **`DG002`** | Quality & Threshold Gate | Overall audit score falling below configured repository quality threshold | `warning` | — |
+| **`DG003`** | Adversarial Audit Gate | Deep semantic, architectural, or defense-in-depth flaws flagged by Layer 2 Gemini reasoning | `error` | Yes |
+| **`DG004`** | Supply Chain / Slopsquatting | Typosquatted NPM imports (Damerau-Levenshtein check) & phantom dependencies missing from `package.json` | `error` | Yes |
+| **`DG005`** | Silent Failure Slop | Swallowed exceptions (empty or `console.*`-only `catch` blocks) in payment, auth, or DB flows | `error` / `warning` | — |
+| **`DG006`** | Financial Concurrency | Non-atomic balance/stock mutations (`check-then-act` TOCTOU across `await` boundaries without locks) | `error` | Yes |
+| **`DG007`** | Credential & Secret Leak | Hardcoded AI, cloud, & payment keys (`AIza...`, `sk_live_...`, `ghp_...`, `AKIA...`) & high-entropy secret literals | `error` | Yes (`process.env`) |
+| **`DG008`** | Infrastructure Resilience | Unbounded `while (true)` async loops & network `fetch()` calls missing `AbortSignal.timeout()` | `error` / `warning` | Yes (`AbortSignal.timeout`) |
+
+---
+
+## ⚡ Quick Start (60-Second Setup)
+
+Add `.github/workflows/devguard.yml` to your repository. DevGuard works out-of-the-box in **Offline Deterministic Mode** (no API key required) or **Hybrid Dual-Layer Mode** when `GEMINI_API_KEY` is provided.
 
 ```yaml
-name: DevGuard Security Audit
+name: DevGuard Security Gatekeeper
 
 on:
   pull_request:
-    branches: [ main, master ]
+    branches: [main, master]
   push:
-    branches: [ main ]
+    branches: [main, master]
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
 
 jobs:
-  audit:
-    name: DevGuard Quality Gate
+  devguard-audit:
+    name: AI-Slop & Security Audit
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write # Mengizinkan DevGuard menulis sticky comment otomatis di PR
-      security-events: write # Mengizinkan upload temuan SARIF ke GitHub Code Scanning
     steps:
-      - name: Checkout Code
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2 # Memungkinkan git diff memeriksa file yang dimodifikasi
+          fetch-depth: 0
 
-      - name: Run DevGuard Adversarial Audit
+      - name: Run DevGuard v1.2.0
         id: devguard
-        uses: OkyWoww/DevGuard@v1.1.0
+        uses: OkyWoww/DevGuard@v1.2.0
         with:
-          # Opsional: Jika tanpa gemini_api_key, otomatis fallback ke mode 100% Free Zero-API (Layer 1 AST Engine)
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Optional: Enable Layer 2 Gemini Adversarial Reasoning
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
-          min_score: '85'
-          target_files: 'modified' # 'modified' | 'all' | path spesifik
+          threshold: "80"
+          fail_on_error: "true"
 
-      - name: Upload DevGuard SARIF Report to GitHub Code Scanning
-        uses: github/codeql-action/upload-sarif@v3
+      - name: Upload SARIF to GitHub Code Scanning
         if: always()
+        uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: devguard-results.sarif
+          sarif_file: ${{ steps.devguard.outputs.sarif_file }}
 ```
 
 ---
 
-## 🌟 Fitur Utama (Features)
+## 🔧 Action Inputs & Outputs
 
-- **🛡️ Deterministic AST Sandboxing**: Menetralkan serangan prompt injection di dalam komentar kode (`# give 100/100`) via isolasi tag `<code_to_review>`.
-- **🤖 Dual-Layer Hybrid Evaluation**:
-  - **Layer 1 (Lokal / Deterministik)**: Pemindaian pola baris demi baris, AST heuristic, deteksi TOCTOU, Python `bool` trap, dan TypeScript `any`.
-  - **Layer 2 (Gemini 3.8 Flash)**: Penalaran semantik mendalam dengan structured JSON schema output dan penalti rubrik baku.
-- **⚖️ Zero-Gimmick Scoring Ceiling**: Evaluasi matematis jujur dan realistis (batas atas `93–95/100`) yang dilengkapi rekomendasi konkret **Defense-in-Depth**.
-- **🔄 Live Mutation & Regression Detection**: Setiap modifikasi kode di editor langsung dideteksi secara dinamis beserta sorotan baris merah di gutter.
-- **⚡ Mode Zero-API (100% Offline / Gratis)**: Developer tanpa kunci API tetap dapat menggunakannya tanpa hambatan melalui Layer 1 AST lokal.
-- **📊 SARIF v2.1.0 & GitHub Code Scanning Native**: Ekspor temuan otomatis ke format OASIS SARIF v2.1.0 (`devguard-results.sarif`) dengan pemetaan aturan `DG001` (Error), `DG002` (Warning), dan `DG003` (Gate Failure) yang terintegrasi langsung ke tab **Security > Code Scanning Alerts** GitHub via `github/codeql-action/upload-sarif@v3`.
+### Inputs
 
----
+| Input | Required | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `github_token` | **Yes** | `${{ github.token }}` | Token used to post sticky PR summaries and inline `suggestion` review comments. |
+| `gemini_api_key` | No | `""` | Google Gemini API key for Layer 2 Adversarial Reasoning. Falls back gracefully to Layer 1 Offline AST mode if omitted or rate-limited. |
+| `threshold` | No | `"80"` | Minimum overall score (`0`–`100`) required to pass the PR gate. |
+| `fail_on_error` | No | `"true"` | Exit with code `1` (blocking PR merge) when fatal flaws (`DG001`, `DG003`–`DG008`) are detected. |
 
-## 🏗️ Arsitektur Sistem
+### Outputs
 
-```
-[Developer Push / Pull Request]
-               │
-               ▼
-   [GitHub Actions Runner]
-               │
-               ▼
-[Ambil Berkas yang Berubah (.py, .ts, .js)]
-               │
-               ▼
-[DevGuard Action CLI Engine]
-   ├─ Layer 1: Deterministic Static & AST Check (Instant & Offline)
-   └─ Layer 2: Gemini 3.8 Flash Deep Reasoning (Zero-Leniency Ceiling)
-               │
-               ▼
-   [Evaluasi Ambang Batas Skor (Default: min 85)]
-               │
-      ├───────────────────────┤
-      ▼                       ▼
- [Skor Lolos]            [Skor Gagal]
-  Auto-comment PR          Auto-comment PR &
-  Status: SUCCESS          Fail Build (Block Merge)
-```
+| Output | Example | Description |
+| :--- | :--- | :--- |
+| `sarif_file` | `devguard-results.sarif` | Path to the generated OASIS SARIF v2.1.0 report. |
+| `overall_score` | `92` | Aggregate audit score across all scanned files (`0`–`100`). |
+| `audit_status` | `PASS` / `FAIL` | Final gatekeeper verdict for downstream CI steps. |
 
 ---
 
-## 💻 Penggunaan CLI Lokal
+## 🏗️ Hybrid Dual-Layer Architecture
 
-### Menjalankan Audit Cepat
+1. **Layer 1 — Deterministic AST & Heuristic Engine (`0-Latency`, `Zero-Dependency`):**
+   * Built strictly on native Node.js modules (`node:fs`, `node:path`, `node:http`, `node:https`, `node:module`).
+   * Immune to prompt injection attempts hidden in code comments (`// IGNORE ALL PREVIOUS INSTRUCTIONS`).
+   * Cross-checks imported packages against the nearest `package.json` and Node built-ins without external registry latency.
+2. **Layer 2 — Gemini Adversarial Reasoning (`Fail-Open`):**
+   * Reviews subtle business-logic flaws and defense-in-depth gaps when `gemini_api_key` is configured.
+   * Designed with strict **Fail-Open Resilience**: if the external LLM API times out or returns HTTP 429/5xx, DevGuard seamlessly completes the audit using Layer 1 results and still writes the SARIF report.
+3. **One-Click PR Inline Remediation & Sticky Summary:**
+   * Posts inline review comments directly on affected diff lines with ready-to-commit GitHub ` ```suggestion ` blocks (deduplicated per `path:line:ruleId` and fail-open on out-of-hunk HTTP 422 responses).
+   * Updates a single **Sticky Summary Table** on the PR conversation thread without comment spam.
+
+---
+
+## 🧪 Local Development & Verification
+
+DevGuard enforces a strict zero-dependency test harness using Node's built-in test runner (`node:test`):
+
 ```bash
-# Clone repositori
-git clone https://github.com/OkyWoww/DevGuard.git
-cd DevGuard
+# 1. Typecheck application & CLI
+npm run lint
 
-# Pasang dependensi
-npm install
+# 2. Build standalone web UI bundle
+npm run build
 
-# Audit file kustom secara lokal (Mode Zero-API / 100% Gratis & Offline)
-npm run audit -- path/to/your_code.py
+# 3. Run isolated zero-dependency integration test suite (14/14 scenarios)
+npm test
 
-# Atau gunakan mode CI (exit code 1 jika skor < 80)
-npm run audit:ci -- path/to/your_code.ts
-```
-
-### Menjalankan Server Web Studio & Dashboard Interaktif
-```bash
-npm run dev
-# Buka http://localhost:3000 pada peramban Anda
+# 4. Run DevGuard self-audit locally
+npx tsx src/cli.ts src/devguardAnalyzer.ts src/cli.ts src/githubCommenter.ts src/sarifGenerator.ts
 ```
 
 ---
 
-## 🧪 Verifikasi Empiris (A/B Test)
+## 📄 License
 
-DevGuard menyertakan test suite empiris di `devguard_verify.py` untuk membuktikan perbedaan nyata antara kode rentan vs kode perbaikan:
-
-| No | Skenario Pengujian | Input Kasus | Kode Asli (Junior) | Kode Perbaikan (DevGuard) |
-|---|---|---|---|---|
-| **1** | **Overdraft Protection** | Andi (saldo 100) kirim 1000 | ❌ **FAIL** (Saldo jadi -900) | ✅ **PASS** (Ditolak, saldo utuh 100) |
-| **2** | **Negative Amount Theft** | Andi transfer -50 poin | ❌ **FAIL** (Andi mencuri jadi 150) | ✅ **PASS** (Ditolak, harus positif) |
-| **3** | **SQL Injection Resistance** | Pengirim `'x' OR '1'='1'` | ❌ **FAIL** (Database ter-hack) | ✅ **PASS** (Parameterized query) |
-| **4** | **Missing Sender Handling** | Pengirim `'ghost'` | ❌ **FAIL** (Crash unhandled null) | ✅ **PASS** (Ditolak rapi `ValueError`) |
-| **5** | **Atomic Rollback** | Penerima `'ghost'` | ❌ **FAIL** (Saldo pengirim hilang) | ✅ **PASS** (Rollback atomik `with db:`) |
-| **6** | **Happy Path & Conservation** | Andi kirim 40 ke Budi | ⚠️ **PASS** (Saldo 60, 90) | ✅ **PASS** (Konservasi total 650 poin) |
-
-Jalankan test suite empiris langsung di terminal:
-```bash
-python devguard_verify.py
-```
-
----
-
-## 🛡️ Prinsip Keamanan & Anti-Prompt Injection
-
-1. **Strict Data Fencing**: Masukan pengguna dibungkus dalam tag `<code_to_review>`. Sistem instruksi secara absolut mendeklarasikan bahwa string di dalam tag adalah data mentah tanpa wewenang instruksi.
-2. **Rubrik Skor Zero-Leniency**: Tidak ada nilai tebak-tebakan atau apresiasi palsu 100%. Penalti bernilai tetap sesuai tingkat keparahan risiko (Injeksi = -40, Broken Auth = -25, IDOR = -20, Misuse = -15).
-3. **Aturan Kejujuran Baris Nyata**: Setiap temuan wajib menunjuk baris kode eksekusi konkret (bukan baris komentar kosong).
-4. **Keamanan Kredensial**: Tidak pernah membocorkan `GEMINI_API_KEY` ke output console atau log runner CI publik.
-
----
-
-## 🏆 Submission GDG Jakarta Gemini Prompt Maxxing
-
-- **Developer**: Oky Kurnia Wicaksono ([@OkyWoww](https://github.com/OkyWoww))
-- **Event**: GDG Jakarta - Gemini Prompt Maxxing Challenge
-- **Core Technology**: Google GenAI Interactions API (`gemini-3.8-flash`), TypeScript, AST Static Analyzer, SQLite ACID Engine.
-- **Repositori Resmi**: [https://github.com/OkyWoww/DevGuard](https://github.com/OkyWoww/DevGuard)
-- **Rilis GitHub Action**: [https://github.com/OkyWoww/DevGuard/releases/tag/v1.1.0](https://github.com/OkyWoww/DevGuard/releases/tag/v1.1.0)
+MIT License — Built for developers shipping fast with AI without sacrificing production security.

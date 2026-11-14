@@ -7,11 +7,15 @@ import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { analyzeCodeDeterministically } from '../src/devguardAnalyzer.js';
+import {
+  analyzeCodeDeterministically,
+  type AuditAnalyzeOptions,
+} from '../src/devguardAnalyzer.js';
 import { evaluateCodeHybrid } from '../src/cli.js';
 import { generateSarifReport } from '../src/sarifGenerator.js';
 import {
   COMMENT_SIGNATURE,
+  postInlineReviewComments,
   postPullRequestComment,
   type FileAuditSummary,
 } from '../src/githubCommenter.js';
@@ -25,10 +29,16 @@ const REPO_ROOT = path.resolve(
   ['.test-dist', 'dist'].includes(path.basename(BUILD_ROOT)) ? '../..' : '..'
 );
 
-function toFileAuditSummary(filePath: string, code: string, minScore = 85): FileAuditSummary {
-  const report = analyzeCodeDeterministically(code);
+function toFileAuditSummary(
+  filePath: string,
+  code: string,
+  minScore = 85,
+  options?: AuditAnalyzeOptions
+): FileAuditSummary {
+  const report = analyzeCodeDeterministically(code, { filePath, ...options });
   const score = report.skor;
-  const passed = !(score.totalScore < minScore || (!report.isHardened && score.security < 70));
+  const hasInlineErrors = report.inlineFindings?.some((f) => f.severity === 'error') ?? false;
+  const passed = !(score.totalScore < minScore || (!report.isHardened && score.security < 70) || hasInlineErrors);
 
   return {
     filePath,
@@ -39,6 +49,7 @@ function toFileAuditSummary(filePath: string, code: string, minScore = 85): File
     passed,
     fatalFlaws: !passed && report.temuanUtama.description ? [report.temuanUtama.description] : [],
     defenseInDepth: report.residualNotes || [],
+    inlineFindings: report.inlineFindings,
   };
 }
 
@@ -132,7 +143,7 @@ test('2. sarifGenerator produces valid SARIF v2.1.0 for DG001, DG002, DG003, emp
     assert.equal(emptySarif.runs.length, 1);
     assert.deepEqual(emptySarif.runs[0].results, []);
     const ruleIds = emptySarif.runs[0].tool.driver.rules.map((r: { id: string }) => r.id);
-    assert.deepEqual(ruleIds, ['DG001', 'DG002', 'DG003']);
+    assert.deepEqual(ruleIds, ['DG001', 'DG002', 'DG003', 'DG004', 'DG005', 'DG006', 'DG007', 'DG008']);
 
     // Full rules (DG001, DG002, DG003) + Windows paths
     const summaries: FileAuditSummary[] = [
@@ -542,5 +553,440 @@ test('6. SPOF graceful degradation (GitHub API + Gemini LLM fallback) and action
   assert.match(actionYml, /overall_score:[\s\S]*?steps\.audit_gate\.outputs\.overall_score/);
   assert.match(actionYml, /audit_status:[\s\S]*?steps\.audit_gate\.outputs\.audit_status/);
   assert.match(actionYml, /sarif_file:[\s\S]*?steps\.audit_gate\.outputs\.sarif_file/);
+});
+
+test('7. DG004 detects typosquatted and phantom packages while ignoring node: builtins and failing safe on bad package.json', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-dg004-test-'));
+
+  try {
+    // 7a. Typosquatted import 'lodahs' -> suggestion 'lodash', ignoring 'node:fs'
+    const typoCode = [
+      "import * as fs from 'node:fs';",
+      "import _ from 'lodahs';",
+      'export function run(x: unknown): boolean {',
+      "  return typeof x === 'string' && fs.existsSync('README.md') && typeof _ === 'function';",
+      '}',
+    ].join('\n');
+
+    const typoReport = analyzeCodeDeterministically(typoCode);
+    const dg004Findings = (typoReport.inlineFindings || []).filter((f) => f.ruleId === 'DG004');
+    assert.equal(dg004Findings.length, 1, 'Only lodahs should trigger DG004; node:fs must be ignored');
+    assert.equal(dg004Findings[0].line, 2);
+    assert.equal(dg004Findings[0].severity, 'error');
+    assert.ok(dg004Findings[0].suggestion?.includes("'lodash'"), 'Expected suggestion to replace lodahs with lodash');
+
+    // 7b. Phantom dependency check via nearest package.json
+    const pkgDir = path.join(tempDir, 'project');
+    const nestedSrcDir = path.join(pkgDir, 'src', 'features');
+    fs.mkdirSync(nestedSrcDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pkgDir, 'package.json'),
+      JSON.stringify({ name: 'tmp-proj', dependencies: { express: '^4.0.0' } }),
+      'utf-8'
+    );
+    const targetFile = path.join(nestedSrcDir, 'handler.ts');
+    const phantomCode = [
+      "import express from 'express';",
+      "import { z } from 'zod/v4';",
+      'export const app = express();',
+      'export const ok = typeof z === "object";',
+    ].join('\n');
+
+    const phantomReport = analyzeCodeDeterministically(phantomCode, { filePath: targetFile });
+    const phantomFindings = (phantomReport.inlineFindings || []).filter((f) => f.ruleId === 'DG004');
+    assert.equal(phantomFindings.length, 1);
+    assert.equal(phantomFindings[0].line, 2);
+    assert.ok(phantomFindings[0].message.includes('zod'));
+
+    // 7c. Malformed package.json must fail-safe without throwing while typosquat check still runs
+    const badPkgDir = path.join(tempDir, 'bad-pkg');
+    fs.mkdirSync(badPkgDir, { recursive: true });
+    fs.writeFileSync(path.join(badPkgDir, 'package.json'), '{ invalid json', 'utf-8');
+    const badFile = path.join(badPkgDir, 'index.ts');
+    const safeReport = analyzeCodeDeterministically("import _ from 'lodahs';", { filePath: badFile });
+    assert.ok((safeReport.inlineFindings || []).some((f) => f.ruleId === 'DG004'));
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('8. DG005 detects swallowed exceptions in critical flows and excludes best-effort cleanup', () => {
+  // Critical payment swallowed exception -> DG005 error
+  const swallowedPaymentCode = [
+    'export async function handleCheckout(amount: number) {',
+    '  if (typeof amount !== "number") throw new Error("invalid");',
+    '  try {',
+    '    await chargePayment(amount);',
+    '  } catch (e) {',
+    '    console.log(e);',
+    '  }',
+    '}',
+  ].join('\n');
+
+  const summary = toFileAuditSummary('src/checkout.ts', swallowedPaymentCode);
+  assert.equal(summary.passed, false);
+  const dg005Critical = (summary.inlineFindings || []).filter((f) => f.ruleId === 'DG005');
+  assert.equal(dg005Critical.length, 1);
+  assert.equal(dg005Critical[0].severity, 'error');
+  assert.equal(dg005Critical[0].line, 5);
+  assert.ok(dg005Critical[0].suggestion, 'Expected remediation suggestion on critical DG005');
+
+  // Best-effort cleanup exclusion -> zero DG005 findings
+  const cleanupCode = [
+    "import * as fs from 'node:fs';",
+    'export function removeTemp(tmp: string) {',
+    '  if (typeof tmp !== "string") return;',
+    '  try { fs.unlinkSync(tmp); } catch {}',
+    '}',
+  ].join('\n');
+
+  const cleanupReport = analyzeCodeDeterministically(cleanupCode);
+  const cleanupDg005 = (cleanupReport.inlineFindings || []).filter((f) => f.ruleId === 'DG005');
+  assert.equal(cleanupDg005.length, 0, 'Best-effort unlinkSync cleanup catch must not trigger DG005');
+});
+
+test('9. DG006 detects non-atomic TOCTOU balance mutation across await boundary and passes transactional updates', () => {
+  const toctouCode = [
+    'export async function withdraw(user: { balance: number }, amount: number, db: { save: () => Promise<void> }) {',
+    '  if (typeof amount !== "number") throw new Error("Invalid");',
+    '  if (user.balance >= amount) {',
+    '    await db.save();',
+    '    user.balance -= amount;',
+    '  }',
+    '}',
+  ].join('\n');
+
+  const badSummary = toFileAuditSummary('src/wallet.ts', toctouCode);
+  assert.equal(badSummary.passed, false);
+  const dg006 = (badSummary.inlineFindings || []).filter((f) => f.ruleId === 'DG006');
+  assert.equal(dg006.length, 1);
+  assert.equal(dg006[0].severity, 'error');
+  assert.equal(dg006[0].line, 5);
+  assert.ok(dg006[0].suggestion?.includes('$transaction'), 'Expected atomic $transaction suggestion');
+
+  // Atomic transaction version should NOT trigger DG006
+  const atomicCode = [
+    'export async function withdrawSafe(db: { $transaction: (fn: unknown) => Promise<void> }, amount: number) {',
+    '  if (typeof amount !== "number") throw new Error("Invalid");',
+    '  await db.$transaction(async (tx: { user: { balance: number } }) => {',
+    '    if (tx.user.balance >= amount) {',
+    '      await Promise.resolve();',
+    '      tx.user.balance -= amount;',
+    '    }',
+    '  });',
+    '}',
+  ].join('\n');
+
+  const safeReport = analyzeCodeDeterministically(atomicCode);
+  const safeDg006 = (safeReport.inlineFindings || []).filter((f) => f.ruleId === 'DG006');
+  assert.equal(safeDg006.length, 0, 'Transactional update must not trigger DG006');
+});
+
+test('10. sarifGenerator registers DG001-DG006 and maps inlineFindings with POSIX URIs', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-sarif-v12-test-'));
+
+  try {
+    const outPath = path.join(tempDir, 'v12.sarif');
+    const summary: FileAuditSummary = {
+      filePath: '.\\src\\services\\billing.ts',
+      security: 25,
+      correctness: 60,
+      maintainability: 80,
+      overall: 55,
+      passed: false,
+      fatalFlaws: ['Combined legacy summary'],
+      defenseInDepth: ['Use idempotency key on Line 14'],
+      inlineFindings: [
+        { ruleId: 'DG004', line: 2, severity: 'error', message: 'Typosquatted import lodahs' },
+        { ruleId: 'DG005', line: 10, severity: 'error', message: 'Swallowed payment exception' },
+        { ruleId: 'DG006', line: 18, severity: 'error', message: 'Non-atomic balance mutation' },
+      ],
+    };
+
+    generateSarifReport([summary], outPath);
+    const sarif = JSON.parse(fs.readFileSync(outPath, 'utf-8'));
+
+    assert.equal(sarif.version, '2.1.0');
+    const ruleIds = sarif.runs[0].tool.driver.rules.map((r: { id: string }) => r.id);
+    assert.deepEqual(ruleIds, ['DG001', 'DG002', 'DG003', 'DG004', 'DG005', 'DG006', 'DG007', 'DG008']);
+
+    const results = sarif.runs[0].results as Array<{
+      ruleId: string;
+      level: string;
+      locations: Array<{ physicalLocation: { artifactLocation: { uri: string }; region: { startLine: number } } }>;
+    }>;
+
+    const dg004 = results.find((r) => r.ruleId === 'DG004');
+    const dg005 = results.find((r) => r.ruleId === 'DG005');
+    const dg006 = results.find((r) => r.ruleId === 'DG006');
+    assert.ok(dg004 && dg005 && dg006, 'Expected DG004, DG005, and DG006 in SARIF results');
+    assert.equal(dg004.locations[0].physicalLocation.region.startLine, 2);
+    assert.equal(dg005.locations[0].physicalLocation.region.startLine, 10);
+    assert.equal(dg006.locations[0].physicalLocation.region.startLine, 18);
+    assert.equal(dg006.locations[0].physicalLocation.artifactLocation.uri, 'src/services/billing.ts');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('11. postInlineReviewComments sends suggestion payload, deduplicates repeat runs, and fails open on HTTP 422', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-inline-review-test-'));
+  const eventPath = path.join(tempDir, 'event.json');
+  fs.writeFileSync(eventPath, JSON.stringify({ pull_request: { number: 99 } }), 'utf-8');
+
+  const existingReviewComments: Array<{ path: string; line: number; body: string }> = [];
+  const postedReviews: Array<{ event: string; comments: Array<{ path: string; line: number; side: string; body: string }> }> = [];
+  let force422 = false;
+
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c) => chunks.push(Buffer.from(c)));
+    req.on('end', () => {
+      const rawBody = Buffer.concat(chunks).toString('utf-8');
+      const method = req.method || 'GET';
+      const url = req.url || '/';
+      res.setHeader('Content-Type', 'application/json');
+
+      if (method === 'GET' && url.startsWith('/repos/OkyWoww/DevGuard/pulls/99/comments')) {
+        res.writeHead(200);
+        res.end(JSON.stringify(existingReviewComments));
+        return;
+      }
+
+      if (method === 'POST' && url === '/repos/OkyWoww/DevGuard/pulls/99/reviews') {
+        if (force422) {
+          res.writeHead(422);
+          res.end(JSON.stringify({ message: 'Unprocessable Entity: Line could not be resolved' }));
+          return;
+        }
+        const parsed = JSON.parse(rawBody) as {
+          event: string;
+          comments: Array<{ path: string; line: number; side: string; body: string }>;
+        };
+        postedReviews.push(parsed);
+        for (const c of parsed.comments) {
+          existingReviewComments.push({ path: c.path, line: c.line, body: c.body });
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify({ id: 555 }));
+        return;
+      }
+
+      res.writeHead(404);
+      res.end(JSON.stringify({ message: 'Not Found' }));
+    });
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address();
+  assert.ok(addr && typeof addr === 'object');
+
+  const prevEnv = {
+    GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+    GITHUB_REPOSITORY: process.env.GITHUB_REPOSITORY,
+    GITHUB_EVENT_PATH: process.env.GITHUB_EVENT_PATH,
+    GITHUB_API_URL: process.env.GITHUB_API_URL,
+  };
+
+  try {
+    process.env.GITHUB_TOKEN = 'test-token';
+    process.env.GITHUB_REPOSITORY = 'OkyWoww/DevGuard';
+    process.env.GITHUB_EVENT_PATH = eventPath;
+    process.env.GITHUB_API_URL = `http://127.0.0.1:${addr.port}///`;
+
+    const summary: FileAuditSummary = {
+      filePath: 'src\\slop.ts',
+      security: 40,
+      correctness: 75,
+      maintainability: 80,
+      overall: 65,
+      passed: false,
+      fatalFlaws: ['Slopsquatting detected'],
+      defenseInDepth: [],
+      inlineFindings: [
+        {
+          ruleId: 'DG004',
+          line: 2,
+          severity: 'error',
+          message: "Typosquatted package 'lodahs'",
+          suggestion: "import _ from 'lodash';",
+        },
+      ],
+    };
+
+    // First run -> posts 1 review containing ```suggestion block
+    await postInlineReviewComments([summary]);
+    assert.equal(postedReviews.length, 1);
+    assert.equal(postedReviews[0].event, 'COMMENT');
+    assert.equal(postedReviews[0].comments[0].path, 'src/slop.ts');
+    assert.equal(postedReviews[0].comments[0].line, 2);
+    assert.equal(postedReviews[0].comments[0].side, 'RIGHT');
+    assert.ok(postedReviews[0].comments[0].body.includes('[DevGuard DG004]'));
+    assert.ok(postedReviews[0].comments[0].body.includes('```suggestion\nimport _ from \'lodash\';\n```'));
+
+    // Second run with same finding -> deduplicated, no second POST
+    await postInlineReviewComments([summary]);
+    assert.equal(postedReviews.length, 1, 'Expected second run on same path+line+rule to be deduplicated');
+
+    // New finding on out-of-hunk line with HTTP 422 -> fail-open without rejecting
+    force422 = true;
+    const outOfHunkSummary: FileAuditSummary = {
+      ...summary,
+      inlineFindings: [
+        {
+          ruleId: 'DG006',
+          line: 42,
+          severity: 'error',
+          message: 'TOCTOU outside diff hunk',
+        },
+      ],
+    };
+    await assert.doesNotReject(async () => {
+      await postInlineReviewComments([outOfHunkSummary]);
+    });
+  } finally {
+    process.env.GITHUB_TOKEN = prevEnv.GITHUB_TOKEN;
+    process.env.GITHUB_REPOSITORY = prevEnv.GITHUB_REPOSITORY;
+    process.env.GITHUB_EVENT_PATH = prevEnv.GITHUB_EVENT_PATH;
+    process.env.GITHUB_API_URL = prevEnv.GITHUB_API_URL;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('12. DG007 detects hardcoded AI/payment/high-entropy secrets with process.env suggestion and excludes safe env/placeholder/data URI code', () => {
+  const fakeGemini = 'AIza' + 'SyD-9k8L7m6N5p4Q3r2S1t0U9v8W7x6Y5z4';
+  const fakeStripe = 'sk_live_' + '51H9xY2zA3bC4dE5fG6hI7jK8lM9nO0p';
+  const leakedCode = [
+    `const GEMINI_KEY = "${fakeGemini}";`,
+    `const stripe = new Stripe("${fakeStripe}");`,
+    `const customApiSecret = "q9W8e7R6t5Y4u3I2o1P0a9S8d7F6";`,
+    'export { GEMINI_KEY, stripe, customApiSecret };',
+  ].join('\n');
+
+  const leakReport = analyzeCodeDeterministically(leakedCode, { filePath: 'src/secrets.ts' });
+  const dg007Findings = (leakReport.inlineFindings || []).filter((f) => f.ruleId === 'DG007');
+  assert.equal(dg007Findings.length, 3, 'Expected DG007 to flag Gemini, Stripe, and high-entropy secret');
+  assert.ok(dg007Findings.every((f) => f.severity === 'error'));
+  assert.ok(dg007Findings[0].suggestion?.includes('process.env.GEMINI_KEY'));
+  assert.ok(dg007Findings[1].suggestion?.includes('process.env.STRIPE_SECRET_KEY'));
+  assert.ok(leakReport.skor.security <= 20);
+
+  const safeCode = [
+    "const apiKey = process.env.GEMINI_API_KEY ?? 'YOUR_API_KEY_HERE';",
+    "const preview = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';",
+    'const keyScanner = /\\bAIza[0-9A-Za-z\\-_]{35}\\b/g;',
+    'export { apiKey, preview, keyScanner };',
+  ].join('\n');
+
+  const safeReport = analyzeCodeDeterministically(safeCode, { filePath: 'src/config.ts' });
+  const safeDg007 = (safeReport.inlineFindings || []).filter((f) => f.ruleId === 'DG007');
+  assert.equal(safeDg007.length, 0, 'Expected process.env, placeholder, data URI, and regex literal to produce 0 DG007 findings');
+});
+
+test('13. DG008 flags unbounded async loops and missing fetch timeout while passing AbortSignal.timeout and localhost tests', () => {
+  const unboundedCode = [
+    'async function pollOpenAi() {',
+    '  while (true) {',
+    '    await fetch("https://api.openai.com/v1/chat");',
+    '  }',
+    '}',
+  ].join('\n');
+
+  const loopReport = analyzeCodeDeterministically(unboundedCode, { filePath: 'src/poll.ts' });
+  const dg008Loop = (loopReport.inlineFindings || []).filter((f) => f.ruleId === 'DG008');
+  assert.ok(dg008Loop.length >= 1, 'Expected DG008 finding on unbounded async polling loop');
+  assert.ok(dg008Loop.some((f) => f.severity === 'error'));
+  assert.ok(dg008Loop.some((f) => f.suggestion?.includes('MAX_ATTEMPTS') || f.suggestion?.includes('AbortSignal.timeout')));
+
+  const missingTimeoutCode = [
+    'export async function callStripe() {',
+    '  return fetch("https://api.stripe.com/v1/charges", {',
+    '    method: "POST",',
+    '  });',
+    '}',
+  ].join('\n');
+
+  const fetchReport = analyzeCodeDeterministically(missingTimeoutCode, { filePath: 'src/pay.ts' });
+  const dg008Fetch = (fetchReport.inlineFindings || []).filter((f) => f.ruleId === 'DG008');
+  assert.equal(dg008Fetch.length, 1);
+  assert.equal(dg008Fetch[0].severity, 'error');
+  assert.ok(dg008Fetch[0].suggestion?.includes('AbortSignal.timeout(15_000)'));
+
+  const safeFetchCode = [
+    'export async function safeCalls() {',
+    '  await fetch("https://api.stripe.com/v1/charges", {',
+    '    method: "POST",',
+    '    signal: AbortSignal.timeout(10000),',
+    '  });',
+    '  await fetch("http://127.0.0.1:8080/health");',
+    '}',
+  ].join('\n');
+
+  const safeFetchReport = analyzeCodeDeterministically(safeFetchCode, { filePath: 'tests/mock.ts' });
+  const safeDg008 = (safeFetchReport.inlineFindings || []).filter((f) => f.ruleId === 'DG008');
+  assert.equal(safeDg008.length, 0, 'Expected AbortSignal.timeout and 127.0.0.1 fetch to pass DG008');
+});
+
+test('14. sarifGenerator registers DG001-DG008 and core module self-audit passes >= 85/100 with zero fatal findings', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'devguard-sarif-dg008-test-'));
+  try {
+    const sarifPath = path.join(tempDir, 'full-rules.sarif');
+    const summaries: FileAuditSummary[] = [
+      {
+        filePath: 'src\\secrets-and-net.ts',
+        security: 40,
+        correctness: 75,
+        maintainability: 80,
+        overall: 65,
+        passed: false,
+        fatalFlaws: [],
+        defenseInDepth: [],
+        inlineFindings: [
+          {
+            ruleId: 'DG007',
+            line: 3,
+            severity: 'error',
+            message: 'Hardcoded Gemini secret',
+          },
+          {
+            ruleId: 'DG008',
+            line: 9,
+            severity: 'error',
+            message: 'Unbounded async fetch without AbortSignal.timeout',
+          },
+        ],
+      },
+    ];
+
+    generateSarifReport(summaries, sarifPath);
+    const sarif = JSON.parse(fs.readFileSync(sarifPath, 'utf-8'));
+    const driverRules = sarif.runs[0].tool.driver.rules.map((r: { id: string }) => r.id);
+    assert.deepEqual(driverRules, ['DG001', 'DG002', 'DG003', 'DG004', 'DG005', 'DG006', 'DG007', 'DG008']);
+    const resultRuleIds = sarif.runs[0].results.map((r: { ruleId: string }) => r.ruleId);
+    assert.ok(resultRuleIds.includes('DG007'));
+    assert.ok(resultRuleIds.includes('DG008'));
+
+    // Self-audit all 4 core DevGuard modules
+    const coreModules = [
+      'src/devguardAnalyzer.ts',
+      'src/cli.ts',
+      'src/githubCommenter.ts',
+      'src/sarifGenerator.ts',
+    ];
+    for (const relPath of coreModules) {
+      const absPath = path.resolve(process.cwd(), relPath);
+      const source = fs.readFileSync(absPath, 'utf-8');
+      const report = analyzeCodeDeterministically(source, { filePath: absPath });
+      const errors = (report.inlineFindings || []).filter((f) => f.severity === 'error');
+      assert.equal(errors.length, 0, `${relPath} unexpectedly triggered error findings: ${JSON.stringify(errors)}`);
+      assert.ok(
+        report.skor.totalScore >= 85,
+        `${relPath} self-audit score ${report.skor.totalScore}/100 must be >= 85`
+      );
+    }
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 });
 
