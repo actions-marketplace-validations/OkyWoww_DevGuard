@@ -227,7 +227,7 @@ Tambahkan skenario pengujian baru di tests/integration.test.ts (sehingga total t
 
     Test 12 (DG007 Secret Detection & Safe Env Exclusion):
 
-        Verifikasi kode dengan const GEMINI_KEY = "AIzaSyD-9k8L7m6N5p4Q3r2S1t0U9v8W7x6Y5z4" atau sk_live_51H... langsung tertangkap sebagai DG007 (error) dengan suggestion berbasis process.env.
+        Verifikasi kode dengan const GEMINI_KEY = "AIzaSyDummyExampleKey_NotReal" (atau contoh key rakitan 39-karakter di kode tes) dan sk_live_51H... langsung tertangkap sebagai DG007 (error) dengan suggestion berbasis process.env.
 
         Verifikasi const apiKey = process.env.GEMINI_API_KEY ?? 'YOUR_API_KEY_HERE' dan string data:image/png;base64,... lolos bersih tanpa false positive.
 
